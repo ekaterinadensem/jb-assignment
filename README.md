@@ -1,1 +1,215 @@
 # jb-assignment
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*
+Task 1: Solution Steps
+1. Cloned a repo to create a local copy
+2. Merged all CSVs together using cmd command "copy *.csv targetfile.csv"
+3. Opened merged CSV file, filtered for rows that contain headers, deleted those rows
+4. Used Import Flat File wizard in SSMS to import the merged CSV file into a db table, DBNINE.paymentgateway.TRANSACTIONS
+*/
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---5. Recreating the summary table to ensure the logic and data is aligned with the table provided in the assignment
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+USE dbnine 
+CREATE SCHEMA netsuite 
+WITH ns AS (
+		SELECT		tr.MERCHANT_ACCOUNT
+					,tr.BATCH_NUMBER
+					,SUM(l.AMOUNT_FOREIGN)				NetSuite
+		FROM		DEA.[netsuite].[TRANSACTIONS]		tr
+		LEFT JOIN	DEA.[netsuite].[TRANSACTION_LINES]	l
+		ON			tr.TRANSACTION_ID = l.TRANSACTION_ID
+		LEFT JOIN	dea.[netsuite].[ACCOUNTS]			a
+		ON			l.ACCOUNT_ID = a.ACCOUNT_ID
+		WHERE		a.ACCOUNTNUMBER IN (315700,315710,315720,315800,548201) 
+		GROUP BY	tr.MERCHANT_ACCOUNT
+					,tr.BATCH_NUMBER
+		)
+,pg AS  (SELECT	MERCHANT_ACCOUNT
+				,BATCH_NUMBER
+				,SUM(GROSS) AS PaymentGateway
+		FROM	DBNINE.paymentgateway.TRANSACTIONS
+		GROUP BY MERCHANT_ACCOUNT
+				,BATCH_NUMBER
+		)
+SELECT		coalesce(ns.MERCHANT_ACCOUNT,pg.MERCHANT_ACCOUNT)	MERCHANT_ACCOUNT
+			,coalesce(ns.BATCH_NUMBER,pg.BATCH_NUMBER)			BATCH_NUMBER
+			,ns.NetSuite
+			,pg.PaymentGateway
+			,coalesce(ns.NetSuite,0) - coalesce(pg.PaymentGateway,0)	Diff
+INTO		dbnine.netsuite.COMPARISON_SUMMARY
+FROM		ns
+FULL JOIN	pg
+ON			ns.MERCHANT_ACCOUNT = pg.MERCHANT_ACCOUNT
+AND			ns.BATCH_NUMBER = pg.BATCH_NUMBER
+ORDER BY 1,2
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---6. Creating table with denormalized netsuite data to be able to compare against PG data
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+WITH ns_transaction_details AS (	
+	SELECT		l.TRANSACTION_ID
+					,s.COUNTRY			SubCountry
+					,s.[NAME]			SubName
+					,e.[NAME]			EntName
+					,e.ENTITY_TYPE		EntType
+					,e.BILL_COUNTRY		EntBillCountry
+					,a.ACCOUNTNUMBER	Acct
+					,a.FULL_NAME		AcctName
+					,CASE	WHEN a.ACCOUNTNUMBER IN (315700,315710,315720,315800,548201) ---creating a flag for relevant accounts
+							THEN 1 ELSE 0	END		RelevantAcct 
+					,sum(l.AMOUNT_FOREIGN) NSamount
+		FROM		DEA.[netsuite].[TRANSACTION_LINES]	l
+		LEFT JOIN	dea.[netsuite].[ACCOUNTS]			a
+		ON			l.ACCOUNT_ID = a.ACCOUNT_ID
+		LEFT JOIN	dea.[netsuite].[SUBSIDIARIES]		s
+		ON			s.SUBSIDIARY_ID = l.SUBSIDIARY_ID
+		LEFT JOIN	dea.[netsuite].[ENTITY]				e
+		ON			l.COMPANY_ID = e.[ENTITY_ID]
+		GROUP BY	l.TRANSACTION_ID
+					,s.COUNTRY		
+					,s.[NAME]		
+					,e.[NAME]		
+					,e.ENTITY_TYPE	
+					,e.BILL_COUNTRY	
+					,a.ACCOUNTNUMBER
+					,a.FULL_NAME
+)
+		SELECT	l.* 
+				,tr.TRANID
+				,tr.TRANSACTION_TYPE
+				,tr.TRANDATE
+				,tr.EXCHANGE_RATE
+				,tr.CURRENCY_ID
+				,cur.[name] Currency
+				,tr.ORDER_REF
+				,tr.MERCHANT_ACCOUNT
+				,tr.BATCH_NUMBER
+				,tr.IS_NON_POSTING
+				,tr.DATE_LAST_MODIFIED
+		INTO	DBNINE.netsuite.TRANSACTIONS
+		FROM		ns_transaction_details			l
+		LEFT JOIN   DEA.[netsuite].[TRANSACTIONS]   tr
+		ON			tr.TRANSACTION_ID = l.TRANSACTION_ID
+		LEFT JOIN	dea.[netsuite].[CURRENCIES]		cur
+		ON			cur.CURRENCY_ID = tr.CURRENCY_ID
+
+---Aggregating NetSuite data by order reference - key that both NS and PG data share - to see if it can be used to join data
+DROP TABLE IF EXISTS #tempnetsuiteaggr
+SELECT	ORDER_REF
+		,MERCHANT_ACCOUNT
+		,BATCH_NUMBER
+		,Currency
+		,SUM(NSamount) NSamount
+INTO	#tempnetsuiteaggr
+FROM	DBNINE.netsuite.TRANSACTIONS
+WHERE	RelevantAcct = 1
+GROUP BY ORDER_REF
+		,MERCHANT_ACCOUNT
+		,BATCH_NUMBER
+		,Currency
+
+---Check if ORDER_REF is distinct in this grouping and can be used to join with Payment Gateway data
+SELECT ORDER_REF, COUNT(*)
+FROM #tempnetsuiteaggr
+GROUP BY ORDER_REF
+ORDER BY 2 DESC
+
+---ORDER_REF is not unique, checking one order to understand why
+SELECT * FROM DBNINE.netsuite.TRANSACTIONS			WHERE ORDER_REF = 'A000033422'
+SELECT * FROM DBNINE.paymentgateway.TRANSACTIONS	WHERE ORDER_REF = 'A000033422'
+---Looks like Transaction_Type and TYPE fields can be used to further aggregate and create a surrogate key
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---7.	Creating a surrogate key, joining NS and PG data
+---		Adding a column to highlight the issue with a given transaction, if any
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+WITH pg AS (
+	SELECT		ORDER_REF
+				,BATCH_NUMBER
+				,MERCHANT_ACCOUNT
+				,CASE	WHEN [TYPE] = 'Settled'	THEN ORDER_REF + '_P'
+						WHEN [TYPE] = 'Refund'	THEN ORDER_REF + '_CD'
+						ELSE ORDER_REF END			OrderRefType
+				,SUM(GROSS) 						PGamount
+				,SUM(FEE)							PGfee
+	FROM		DBNINE.paymentgateway.TRANSACTIONS
+	GROUP BY	ORDER_REF
+				,BATCH_NUMBER
+				,MERCHANT_ACCOUNT
+				,[TYPE]
+)
+,ns AS (
+	SELECT		MERCHANT_ACCOUNT
+				,BATCH_NUMBER
+				,ORDER_REF
+				,CASE	WHEN TRANSACTION_TYPE = 'Payment'			THEN ORDER_REF + '_P'
+						WHEN TRANSACTION_TYPE = 'Customer Deposit'	THEN ORDER_REF + '_CD'
+						ELSE ORDER_REF END			OrderRefType
+				,SUM(NSamount)						NSamount
+	FROM		DBNINE.netsuite.TRANSACTIONS
+	WHERE		RelevantAcct = 1
+	GROUP BY	MERCHANT_ACCOUNT
+				,BATCH_NUMBER
+				,ORDER_REF	
+				,TRANSACTION_TYPE
+)
+--select OrderRefType, count(*) from pg group by OrderRefType order by 2 desc	---making sure the new key is unique
+--select OrderRefType, count(*) from ns group by OrderRefType order by 2 desc	---making sure the new key is unique
+,comp AS(		
+	SELECT	 COALESCE(ns.ORDER_REF,pg.ORDER_REF)			ORDER_REF
+			,COALESCE(ns.OrderRefType,pg.OrderRefType)	OrderRefType
+			,ns.MERCHANT_ACCOUNT	NSmerchant
+			,ns.BATCH_NUMBER		NSbatch
+			,pg.MERCHANT_ACCOUNT	PGmerchant
+			,pg.BATCH_NUMBER		PGbatch
+			,NSamount
+			,PGamount
+			,ABS(COALESCE(NSamount,0) - COALESCE(PGamount,0))	Diff
+	FROM		ns
+	FULL JOIN	pg ON ns.OrderRefType = pg.OrderRefType
+)
+SELECT		comp.*
+--			,PGfee	
+			,CASE	WHEN comp.NSamount IS NULL AND comp.NSbatch IS NULL AND comp.NSmerchant IS NULL
+					THEN 'Transaction missing from NS data (not a relevant account)'
+					WHEN comp.NSamount IS NOT NULL AND comp.NSbatch IS NULL AND comp.Diff = 0
+					THEN 'Batch number missing in NS data'
+					WHEN comp.PGbatch <> COALESCE(comp.NSbatch,0)
+					THEN 'Batch mismatch'
+					WHEN comp.NSbatch = comp.PGbatch AND comp.NSmerchant = comp.PGmerchant AND comp.DIFF = 0
+					THEN 'No issue'
+					WHEN comp.NSamount IS NOT NULL AND comp.Diff > 0 AND comp.NSamount = pg.PGfee
+					THEN 'Only fee amount present in NS data'
+					ELSE NULL END Issue 
+INTO		DBNINE.netsuite.TRANSACTION_ANALYSIS
+FROM		comp
+LEFT JOIN	pg 
+ON			pg.OrderRefType = comp.OrderRefType
+
+
+---Check to make sure the totals are still aligned-------------------------------------------------------
+SELECT	SUM(nsamount) ns, SUM(pgamount) pg, SUM(nsamount)-SUM(pgamount) diff 
+FROM	DBNINE.netsuite.TRANSACTION_ANALYSIS
+SELECT	SUM(NetSuite) ns, SUM(paymentgateway) pg, SUM(NetSuite)- SUM(paymentgateway) diff 
+FROM	dbnine.netsuite.COMPARISON_SUMMARY
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 8. Create a table to contain only transactions with issues
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SELECT	*
+INTO	DBNINE.netsuite.TRANSACTION_ISSUES
+FROM	DBNINE.netsuite.TRANSACTION_ANALYSIS
+WHERE	Issue <> 'No issue'
+
+
+
+
+
+
+
+
+
+
